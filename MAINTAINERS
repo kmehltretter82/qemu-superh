@@ -4090,7 +4090,9 @@ F: hw/i2c/core.c
 F: hw/i2c/smbus_slave.c
 F: hw/i2c/smbus_master.c
 F: hw/i2c/smbus_eeprom.c
+F: hw/i2c/pca9564.c
 F: include/hw/i2c/i2c.h
+F: include/hw/i2c/pca9564.h
 F: include/hw/i2c/smbus_master.h
 F: include/hw/i2c/smbus_slave.h
 F: include/hw/i2c/smbus_eeprom.h

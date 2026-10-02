@@ -23,9 +23,12 @@
 /* Flags definitions */
 #define SECONDS_CH 0x80
 #define HOURS_PM   0x20
+#define CTRL1_24   0x20
 #define CTRL2_24   0x20
+#define R2025SD_CTRL2_XSTP 0x20
 
 #define TYPE_RS5C372 "rs5c372"
+#define TYPE_R2025SD "r2025sd"
 OBJECT_DECLARE_SIMPLE_TYPE(RS5C372State, RS5C372)
 
 struct RS5C372State {
@@ -37,7 +40,17 @@ struct RS5C372State {
     uint8_t ptr;
     uint8_t tx_format;
     bool addr_byte;
+    bool r2025sd;
 };
+
+static bool rs5c372_24_hour(RS5C372State *s)
+{
+    if (s->r2025sd) {
+        return s->nvram[0xe] & CTRL1_24;
+    }
+
+    return s->nvram[0xf] & CTRL2_24;
+}
 
 static void capture_current_time(RS5C372State *s)
 {
@@ -49,7 +62,7 @@ static void capture_current_time(RS5C372State *s)
     qemu_get_timedate(&now, s->offset);
     s->nvram[0] = to_bcd(now.tm_sec);
     s->nvram[1] = to_bcd(now.tm_min);
-    if (s->nvram[0xf] & CTRL2_24) {
+    if (rs5c372_24_hour(s)) {
         s->nvram[2] = to_bcd(now.tm_hour);
     } else {
         int tmp = now.tm_hour;
@@ -136,7 +149,7 @@ static int rs5c372_send(I2CSlave *i2c, uint8_t data)
             now.tm_min = from_bcd(data & 0x7f);
             break;
         case 2:
-            if (s->nvram[0xf] & CTRL2_24) {
+            if (rs5c372_24_hour(s)) {
                 now.tm_hour = from_bcd(data & 0x3f);
             } else {
                 int tmp = from_bcd(data & (HOURS_PM - 1));
@@ -185,6 +198,11 @@ static void rs5c372_reset_hold(Object *obj, ResetType type)
     s->offset = 0;
     s->wday_offset = 0;
     memset(s->nvram, 0, NVRAM_SIZE);
+    if (s->r2025sd) {
+        /* R2025SD XSTP=1 means the oscillator is running. */
+        s->nvram[0xe] = CTRL1_24;
+        s->nvram[0xf] = R2025SD_CTRL2_XSTP;
+    }
     s->ptr = 0;
     s->addr_byte = false;
 }
@@ -210,6 +228,11 @@ static void rs5c372_init(Object *obj)
     qdev_prop_set_uint8(DEVICE(obj), "address", 0x32);
 }
 
+static void r2025sd_init(Object *obj)
+{
+    RS5C372(obj)->r2025sd = true;
+}
+
 static void rs5c372_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -230,6 +253,11 @@ static const TypeInfo rs5c372_types[] = {
         .instance_size = sizeof(RS5C372State),
         .instance_init = rs5c372_init,
         .class_init    = rs5c372_class_init,
+    },
+    {
+        .name          = TYPE_R2025SD,
+        .parent        = TYPE_RS5C372,
+        .instance_init = r2025sd_init,
     },
 };
 

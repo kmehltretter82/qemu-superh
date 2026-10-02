@@ -5,8 +5,8 @@
  * the SH7785 hardware manual 1.5 for the areas):
  *   0x00000000 NOR flash (CS0, 64 MiB, 32-bit bus), -drive if=pflash
  *   0x04000000 PLD registers (CS1)
- *   0x06000000 PCA9564 I2C (CS1)             - not modelled yet
- *   0x10000000 SM107 graphics (CS4)          - not modelled yet
+ *   0x06000000 PCA9564 I2C (CS1)
+ *   0x10000000 SM107/SM501 graphics (CS4)
  *   0x40000000 DDR2 SDRAM, 512 MiB, in the 32-bit physical space
  *              (DBSC0 to DBSC7). In 29-bit mode area 2 (0x08000000) and
  *              area 3 (0x0c000000) show DBSC2 and DBSC3, i.e. DDR2 offsets
@@ -51,6 +51,9 @@
 #include "hw/sh4/sh7785.h"
 #include "hw/pci-host/sh7785_pcic.h"
 #include "hw/pci/pci.h"
+#include "hw/ide/pci.h"
+#include "hw/i2c/i2c.h"
+#include "hw/i2c/pca9564.h"
 #include "hw/core/sysbus.h"
 #include "hw/usb/hcd-r8a66597.h"
 #include "system/address-spaces.h"
@@ -72,6 +75,11 @@
 #define PLD_BASE            0x04000000
 #define PLD_POFCR           0x06    /* write 1: power off */
 #define PLD_VERSR           0x0c
+
+#define PCA9564_BASE        0x06000000
+#define SM501_VRAM_BASE     0x10000000
+#define SM501_MMIO_BASE     0x13e00000
+#define SM501_VRAM_SIZE     (4 * MiB)
 
 #define USB_32BIT_BASE      0x08000000
 #define USB_29BIT_BASE      0x14000000
@@ -272,6 +280,11 @@ static void sh7785lcr_init(MachineState *machine)
     SH7785LCRMachineState *s = SH7785LCR_MACHINE(machine);
     MemoryRegion *sysmem = get_system_memory();
     MemoryRegion *pld = g_new(MemoryRegion, 1);
+    PCIBus *pci_bus;
+    PCIIDEState *sata;
+    DeviceState *dev;
+    SysBusDevice *sbd;
+    I2CBus *i2c_bus;
     DeviceState *usb;
     SysBusDevice *usb_sbd;
     DriveInfo *dinfo;
@@ -301,8 +314,38 @@ static void sh7785lcr_init(MachineState *machine)
     memory_region_add_subregion_overlap(sysmem, 0x10000000, s->pci_mem1, 1);
     memory_region_set_enabled(s->pci_mem1, false);
     sh7785_set_mmselr_hook(s->soc, sh7785lcr_areasel, s);
-    pci_init_nic_devices(PCI_HOST_BRIDGE(sh7785_pcic(s->soc))->bus,
-                         mc->default_nic);
+    pci_bus = PCI_HOST_BRIDGE(sh7785_pcic(s->soc))->bus;
+
+    /* Adrian's board has the RTL8169SC in slot 0 and SiI3512 in slot 1. */
+    pci_init_nic_in_slot(pci_bus, mc->default_nic, NULL, "0");
+    sata = PCI_IDE(pci_create_simple(pci_bus, PCI_DEVFN(1, 0), "sii3512"));
+    dinfo = drive_get_by_index(IF_IDE, 0);
+    if (dinfo) {
+        /* The SSD in Adrian's boot log is connected to the second port. */
+        ide_bus_create_drive(&sata->bus[1], 0, dinfo);
+    }
+    dinfo = drive_get_by_index(IF_IDE, 1);
+    if (dinfo) {
+        ide_bus_create_drive(&sata->bus[0], 0, dinfo);
+    }
+    pci_init_nic_devices(pci_bus, mc->default_nic);
+
+    dev = qdev_new("sysbus-sm501");
+    sbd = SYS_BUS_DEVICE(dev);
+    qdev_prop_set_uint32(dev, "vram-size", SM501_VRAM_SIZE);
+    qdev_prop_set_uint64(dev, "dma-offset", SM501_VRAM_BASE);
+    sysbus_realize_and_unref(sbd, &error_fatal);
+    sysbus_mmio_map_overlap(sbd, 0, SM501_VRAM_BASE, 2);
+    sysbus_mmio_map_overlap(sbd, 1, SM501_MMIO_BASE, 2);
+    sysbus_connect_irq(sbd, 0, sh7785_irq_pin(s->soc, 4));
+
+    dev = qdev_new(TYPE_PCA9564);
+    sbd = SYS_BUS_DEVICE(dev);
+    sysbus_realize_and_unref(sbd, &error_fatal);
+    sysbus_mmio_map(sbd, 0, PCA9564_BASE);
+    sysbus_connect_irq(sbd, 0, sh7785_irq_pin(s->soc, 5));
+    i2c_bus = I2C_BUS(qdev_get_child_bus(dev, "i2c"));
+    i2c_slave_create_simple(i2c_bus, "r2025sd", 0x32);
 
     /*
      * NOR flash: Linux registers it as physmap-flash with bankwidth 4.
@@ -366,7 +409,8 @@ static void sh7785lcr_class_init(ObjectClass *oc, const void *data)
     mc->default_cpu_type = TYPE_SH7785_CPU;
     mc->default_ram_size = DDR_SIZE;
     mc->default_ram_id = "sh7785lcr.sdram";
-    mc->default_nic = "rtl8139";   /* e1000 needs a kernel fix (port I/O) */
+    mc->block_default_type = IF_IDE;
+    mc->default_nic = "rtl8169";
     object_class_property_add_bool(oc, "boot32", sh7785lcr_get_boot32,
                                    sh7785lcr_set_boot32);
     object_class_property_set_description(oc, "boot32",

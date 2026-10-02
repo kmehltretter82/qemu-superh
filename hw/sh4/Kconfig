@@ -34,7 +34,11 @@ config SH7785LCR
     select SH7785
     select PFLASH_CFI02
     select USB_R8A66597
+    select SM501
+    select PCA9564
+    select RS5C372_RTC
     imply PCI_DEVICES
     imply E1000_PCI
     imply RTL8139_PCI
+    imply RTL8169_PCI
     imply IDE_SII3112

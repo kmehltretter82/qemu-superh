@@ -20,6 +20,7 @@
 #include "ide-internal.h"
 
 #define TYPE_SII3112_PCI "sii3112"
+#define TYPE_SII3512_PCI "sii3512"
 OBJECT_DECLARE_SIMPLE_TYPE(SiI3112PCIState, SII3112_PCI)
 
 typedef struct SiI3112Regs {
@@ -257,6 +258,9 @@ static void sii3112_pci_realize(PCIDevice *dev, Error **errp)
 
     pci_config_set_interrupt_pin(dev->config, 1);
     pci_set_byte(dev->config + PCI_CACHE_LINE_SIZE, 8);
+    pci_set_word(dev->config + PCI_STATUS,
+                 pci_get_word(dev->config + PCI_STATUS) |
+                 PCI_STATUS_66MHZ);
 
     /* BAR5 is in PCI memory space */
     memory_region_init_io(&d->mmio, OBJECT(d), &sii3112_reg_ops, d,
@@ -312,9 +316,26 @@ static const TypeInfo sii3112_pci_info = {
     .class_init = sii3112_pci_class_init,
 };
 
+static void sii3512_pci_class_init(ObjectClass *klass, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    PCIDeviceClass *pd = PCI_DEVICE_CLASS(klass);
+
+    pd->device_id = 0x3512;
+    pd->class_id = PCI_CLASS_STORAGE_OTHER;
+    dc->desc = "SiI3512 SATA controller";
+}
+
+static const TypeInfo sii3512_pci_info = {
+    .name = TYPE_SII3512_PCI,
+    .parent = TYPE_SII3112_PCI,
+    .class_init = sii3512_pci_class_init,
+};
+
 static void sii3112_register_types(void)
 {
     type_register_static(&sii3112_pci_info);
+    type_register_static(&sii3512_pci_info);
 }
 
 type_init(sii3112_register_types)

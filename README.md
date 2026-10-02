@@ -14,9 +14,10 @@ upstream as issues with reproducers, not as patches.
 - **SH7785LCR board** (`-M sh7785lcr`): SH7785 (SH-4A) with TLB extended
   mode, 32-bit address mode with the PMB (`-M sh7785lcr,boot32=on`),
   the SH7785 interrupt controller, SCIF0-5, TMU0-5, 512 MiB DDR2, CFI
-  flash, and the PCI host controller (SATA through `sii3112`, network
-  through `rtl8139` or `e1000`). Mainline Linux (`sh7785lcr_defconfig`,
-  `sh7785lcr_32bit_defconfig`) and U-Boot boot on it.
+  flash, SM501 display, PCA9564 I2C with an R2025SD RTC, R8A66597 USB,
+  and the PCI host controller with an RTL8169SC NIC and SiI3512 SATA.
+  Mainline Linux (`sh7785lcr_defconfig`, `sh7785lcr_32bit_defconfig`)
+  and U-Boot boot on it.
 - **SH-4 fixes** on `r2d` and in the CPU: TLB entry flushing, associative
   TLB writes, 1 KiB pages, interrupt delivery after RTE, SH7750 INTC
   priorities, MMUCR, timers, serial input, reset vector, CVR cache sizes.
