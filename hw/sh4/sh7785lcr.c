@@ -52,6 +52,7 @@
 #include "hw/pci-host/sh7785_pcic.h"
 #include "hw/pci/pci.h"
 #include "hw/core/sysbus.h"
+#include "hw/usb/hcd-r8a66597.h"
 #include "system/address-spaces.h"
 #include "system/reset.h"
 #include "system/runstate.h"
@@ -71,6 +72,9 @@
 #define PLD_BASE            0x04000000
 #define PLD_POFCR           0x06    /* write 1: power off */
 #define PLD_VERSR           0x0c
+
+#define USB_32BIT_BASE      0x08000000
+#define USB_29BIT_BASE      0x14000000
 
 #define FRQMR1              0xffc80014
 #define FRQMR1_MODE16       0x12252448
@@ -268,6 +272,8 @@ static void sh7785lcr_init(MachineState *machine)
     SH7785LCRMachineState *s = SH7785LCR_MACHINE(machine);
     MemoryRegion *sysmem = get_system_memory();
     MemoryRegion *pld = g_new(MemoryRegion, 1);
+    DeviceState *usb;
+    SysBusDevice *usb_sbd;
     DriveInfo *dinfo;
 
     if (machine->ram_size != DDR_SIZE) {
@@ -312,6 +318,15 @@ static void sh7785lcr_init(MachineState *machine)
     memory_region_init_io(pld, NULL, &pld_ops, g_new0(uint16_t, 8),
                           "sh7785lcr-pld", 0x10);
     memory_region_add_subregion(sysmem, PLD_BASE, pld);
+
+    usb = qdev_new(TYPE_R8A66597_USB_HOST);
+    usb_sbd = SYS_BUS_DEVICE(usb);
+    sysbus_realize_and_unref(usb_sbd, &error_fatal);
+    memory_region_add_subregion_overlap(
+        sysmem, s->boot32 ? USB_32BIT_BASE : USB_29BIT_BASE,
+        sysbus_mmio_get_region(usb_sbd, 0), 2);
+    sysbus_connect_irq(usb_sbd, 0, sh7785_irq_pin(s->soc, 0));
+    usb_create_simple(r8a66597_usb_bus(R8A66597_USB_HOST(usb)), "usb-kbd");
 
     if (machine->kernel_filename) {
         sh7785lcr_load_kernel(s, machine);
