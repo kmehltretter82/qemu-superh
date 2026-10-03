@@ -44,6 +44,21 @@ PFlashCFI02 *pflash_cfi02_register(hwaddr base,
                                    uint16_t unlock_addr1,
                                    int be);
 
+PFlashCFI02 *pflash_cfi02_register_with_device_width(
+                                   hwaddr base,
+                                   const char *name,
+                                   hwaddr size,
+                                   BlockBackend *blk,
+                                   uint32_t sector_len,
+                                   int nb_mappings,
+                                   int width,
+                                   int device_width,
+                                   uint16_t id0, uint16_t id1,
+                                   uint16_t id2, uint16_t id3,
+                                   uint16_t unlock_addr0,
+                                   uint16_t unlock_addr1,
+                                   int be);
+
 /* m25p80.c */
 
 #define TYPE_M25P80 "m25p80-generic"

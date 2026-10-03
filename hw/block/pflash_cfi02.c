@@ -78,6 +78,7 @@ struct PFlashCFI02 {
     uint32_t chip_len;
     uint8_t mappings;
     uint8_t width;
+    uint8_t device_width;
     uint8_t be;
     int wcycle; /* if 0, the flash is read normally */
     int bypass;
@@ -290,6 +291,19 @@ static uint64_t pflash_data_read(PFlashCFI02 *pfl, hwaddr offset,
     return ret;
 }
 
+/* Replicate one device's response across all devices in the bank. */
+static uint64_t pflash_query_response(PFlashCFI02 *pfl, uint64_t response)
+{
+    uint64_t device_mask = MAKE_64BIT_MASK(0, pfl->device_width * 8);
+    uint64_t ret = response & device_mask;
+    unsigned int i;
+
+    for (i = pfl->device_width; i < pfl->width; i += pfl->device_width) {
+        ret |= (response & device_mask) << (i * 8);
+    }
+    return ret;
+}
+
 typedef struct {
     uint32_t len;
     uint32_t num;
@@ -362,7 +376,7 @@ static uint64_t pflash_read(void *opaque, hwaddr offset, unsigned int width)
             /* Toggle bit 2, but not 6. */
             toggle_dq2(pfl);
             /* Status register read */
-            ret = pfl->status;
+            ret = pflash_query_response(pfl, pfl->status);
             trace_pflash_read_status(pfl->name, ret);
             break;
         }
@@ -373,15 +387,18 @@ static uint64_t pflash_read(void *opaque, hwaddr offset, unsigned int width)
         switch (boff) {
         case 0x00:
         case 0x01:
-            ret = boff & 0x01 ? pfl->ident1 : pfl->ident0;
+            ret = pflash_query_response(pfl,
+                    boff & 0x01 ? pfl->ident1 : pfl->ident0);
             break;
         case 0x02:
-            ret = 0x00; /* Pretend all sectors are unprotected */
+            /* Pretend all sectors are unprotected. */
+            ret = pflash_query_response(pfl, 0x00);
             break;
         case 0x0E:
         case 0x0F:
             ret = boff & 0x01 ? pfl->ident3 : pfl->ident2;
             if (ret != (uint8_t)-1) {
+                ret = pflash_query_response(pfl, ret);
                 break;
             }
             /* Fall through to data read. */
@@ -399,13 +416,13 @@ static uint64_t pflash_read(void *opaque, hwaddr offset, unsigned int width)
         /* Toggle bit 6 */
         toggle_dq6(pfl);
         /* Status register read */
-        ret = pfl->status;
+        ret = pflash_query_response(pfl, pfl->status);
         trace_pflash_read_status(pfl->name, ret);
         break;
     case 0x98:
         /* CFI query mode */
         if (boff < sizeof(pfl->cfi_table)) {
-            ret = pfl->cfi_table[boff];
+            ret = pflash_query_response(pfl, pfl->cfi_table[boff]);
         } else {
             ret = 0;
         }
@@ -785,7 +802,8 @@ static void pflash_cfi02_fill_cfi_table(PFlashCFI02 *pfl, int nb_regions)
     /* Max timeout for chip erase */
     pfl->cfi_table[0x26] = 0x0D;
     /* Device size */
-    pfl->cfi_table[0x27] = ctz32(pfl->chip_len);
+    pfl->cfi_table[0x27] = ctz32(pfl->chip_len /
+                                 (pfl->width / pfl->device_width));
     /* Flash device interface (8 & 16 bits) */
     pfl->cfi_table[0x28] = 0x02;
     pfl->cfi_table[0x29] = 0x00;
@@ -800,7 +818,8 @@ static void pflash_cfi02_fill_cfi_table(PFlashCFI02 *pfl, int nb_regions)
     pfl->cfi_table[0x2c] = nb_regions;
     /* Erase block regions */
     for (int i = 0; i < nb_regions; ++i) {
-        uint32_t sector_len_per_device = pfl->sector_len[i];
+        uint32_t sector_len_per_device = pfl->sector_len[i] /
+                                         (pfl->width / pfl->device_width);
         pfl->cfi_table[0x2d + 4 * i] = pfl->nb_blocs[i] - 1;
         pfl->cfi_table[0x2e + 4 * i] = (pfl->nb_blocs[i] - 1) >> 8;
         pfl->cfi_table[0x2f + 4 * i] = sector_len_per_device >> 8;
@@ -856,6 +875,16 @@ static void pflash_cfi02_realize(DeviceState *dev, Error **errp)
         error_setg(errp, "attribute \"name\" not specified.");
         return;
     }
+    if (!pfl->device_width) {
+        pfl->device_width = pfl->width;
+    }
+    if (!is_power_of_2(pfl->width) || pfl->width > 4 ||
+        !is_power_of_2(pfl->device_width) ||
+        pfl->device_width > pfl->width) {
+        error_setg(errp, "unsupported device width %u for bank width %u",
+                   pfl->device_width, pfl->width);
+        return;
+    }
 
     int nb_regions;
     pfl->chip_len = 0;
@@ -866,6 +895,12 @@ static void pflash_cfi02_realize(DeviceState *dev, Error **errp)
         }
         pfl->total_sectors += pfl->nb_blocs[nb_regions];
         uint64_t sector_len_per_device = pfl->sector_len[nb_regions];
+
+        if (sector_len_per_device % (pfl->width / pfl->device_width)) {
+            error_setg(errp, "sector length[%d] is not divisible by the "
+                       "number of interleaved devices", nb_regions);
+            return;
+        }
 
         /*
          * The size of each flash sector must be a power of 2 and it must be
@@ -976,6 +1011,7 @@ static const Property pflash_cfi02_properties[] = {
     DEFINE_PROP_UINT32("num-blocks3", PFlashCFI02, nb_blocs[3], 0),
     DEFINE_PROP_UINT32("sector-length3", PFlashCFI02, sector_len[3], 0),
     DEFINE_PROP_UINT8("width", PFlashCFI02, width, 0),
+    DEFINE_PROP_UINT8("device-width", PFlashCFI02, device_width, 0),
     DEFINE_PROP_UINT8("mappings", PFlashCFI02, mappings, 0),
     DEFINE_PROP_UINT8("big-endian", PFlashCFI02, be, 0),
     DEFINE_PROP_UINT16("id0", PFlashCFI02, ident0, 0),
@@ -1032,6 +1068,25 @@ PFlashCFI02 *pflash_cfi02_register(hwaddr base,
                                    uint16_t unlock_addr1,
                                    int be)
 {
+    return pflash_cfi02_register_with_device_width(
+        base, name, size, blk, sector_len, nb_mappings, width, width,
+        id0, id1, id2, id3, unlock_addr0, unlock_addr1, be);
+}
+
+PFlashCFI02 *pflash_cfi02_register_with_device_width(
+                                   hwaddr base,
+                                   const char *name,
+                                   hwaddr size,
+                                   BlockBackend *blk,
+                                   uint32_t sector_len,
+                                   int nb_mappings, int width,
+                                   int device_width,
+                                   uint16_t id0, uint16_t id1,
+                                   uint16_t id2, uint16_t id3,
+                                   uint16_t unlock_addr0,
+                                   uint16_t unlock_addr1,
+                                   int be)
+{
     DeviceState *dev = qdev_new(TYPE_PFLASH_CFI02);
 
     if (blk) {
@@ -1041,6 +1096,7 @@ PFlashCFI02 *pflash_cfi02_register(hwaddr base,
     qdev_prop_set_uint32(dev, "num-blocks", size / sector_len);
     qdev_prop_set_uint32(dev, "sector-length", sector_len);
     qdev_prop_set_uint8(dev, "width", width);
+    qdev_prop_set_uint8(dev, "device-width", device_width);
     qdev_prop_set_uint8(dev, "mappings", nb_mappings);
     qdev_prop_set_uint8(dev, "big-endian", !!be);
     qdev_prop_set_uint16(dev, "id0", id0);
