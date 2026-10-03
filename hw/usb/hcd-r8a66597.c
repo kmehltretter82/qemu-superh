@@ -3,9 +3,10 @@
  *
  * The model implements the external controller's host mode, including its
  * two root ports, ten programmable pipes, and the CFIFO/D0FIFO/D1FIFO CPU
- * interfaces.  Peripheral mode and the external DMA handshake pins are not
+ * interfaces.  The two external DMA interfaces expose DREQ, DACK, and the
+ * bidirectional DEND handshake through GPIOs.  Peripheral mode is not
  * modelled.  Shared FIFO allocation, double buffering, and split-transaction
- * timing are represented functionally rather than cycle accurately.
+ * timing are represented functionally rather than cycle accurate.
  *
  * Reference: R8A66597FP/DFP/BG Datasheet, Rev.1.01,
  * document REJ03F0229-0101, October 17, 2008.
@@ -118,6 +119,19 @@
 #define FRDY                0x2000
 #define DTLN                0x0fff
 
+/* DMA pin configuration */
+#define DMA_DREQA           0x4000
+#define DMA_BURST           0x2000
+#define DMA_DACKA           0x0400
+#define DMA_DFORM           0x0380
+#define DMA_DENDA           0x0040
+#define DMA_PKTM            0x0020
+#define DMA_DENDE           0x0010
+#define DMA_OBUS            0x0004
+#define DMA_CFG_MASK        (DMA_DREQA | DMA_BURST | DMA_DACKA | \
+                             DMA_DFORM | DMA_DENDA | DMA_PKTM | \
+                             DMA_DENDE | DMA_OBUS)
+
 /* Interrupt enable/status bits */
 #define BEMPE               0x0400
 #define NRDYE               0x0200
@@ -200,6 +214,8 @@ struct R8A66597State {
 
     MemoryRegion mmio;
     qemu_irq irq;
+    qemu_irq dreq[2];
+    qemu_irq dend[2];
     USBBus bus;
     USBPort port[R8A66597_NUM_PORTS];
     QEMUTimer *frame_timer;
@@ -207,6 +223,10 @@ struct R8A66597State {
     uint16_t regs[R8A66597_MMIO_SIZE / sizeof(uint16_t)];
     bool connected[R8A66597_NUM_PORTS];
     bool resetting[R8A66597_NUM_PORTS];
+    bool dack_level[2];
+    bool dend_level[2];
+    bool dma_cycle_hold[2];
+    bool dma_dend_pending[2];
     R8A66597Pipe pipe[R8A66597_NUM_PIPES];
 
     unsigned int control_length;
@@ -306,6 +326,134 @@ static bool r8a66597_pipe_out(R8A66597State *s, R8A66597Pipe *pipe,
     return (pipe->cfg & PIPE_DIR_OUT) != 0;
 }
 
+static hwaddr r8a66597_dma_cfg(unsigned int channel)
+{
+    return channel ? DMA1CFG : DMA0CFG;
+}
+
+static hwaddr r8a66597_dma_select(unsigned int channel)
+{
+    return channel ? D1FIFOSEL : D0FIFOSEL;
+}
+
+static int r8a66597_dma_channel(hwaddr fifo)
+{
+    if (fifo == D0FIFO) {
+        return 0;
+    }
+    if (fifo == D1FIFO) {
+        return 1;
+    }
+    return -1;
+}
+
+static bool r8a66597_dma_input_active(bool level, uint16_t cfg,
+                                      uint16_t polarity)
+{
+    return level == ((cfg & polarity) != 0);
+}
+
+static int r8a66597_dma_output_level(bool asserted, uint16_t cfg,
+                                     uint16_t polarity)
+{
+    bool active_high = (cfg & polarity) != 0;
+
+    return asserted ? active_high : !active_high;
+}
+
+static bool r8a66597_dma_ready(R8A66597State *s, unsigned int channel,
+                               R8A66597Pipe **selected)
+{
+    hwaddr select = r8a66597_dma_select(channel);
+    R8A66597Pipe *pipe = r8a66597_selected_pipe(s, select);
+
+    if (selected) {
+        *selected = pipe;
+    }
+    if (!pipe || !pipe->index ||
+        !(*r8a66597_reg(s, select) & DREQE)) {
+        return false;
+    }
+    if (r8a66597_pipe_out(s, pipe, select)) {
+        return !pipe->packet_active && !pipe->tx_valid;
+    }
+    return pipe->fifo_ready && pipe->fifo_pos < pipe->fifo_len;
+}
+
+static void r8a66597_update_dma_channel(R8A66597State *s,
+                                        unsigned int channel)
+{
+    hwaddr select = r8a66597_dma_select(channel);
+    uint16_t cfg = *r8a66597_reg(s, r8a66597_dma_cfg(channel));
+    R8A66597Pipe *pipe;
+    unsigned int remaining = 0;
+    unsigned int unit = 1;
+    bool ready;
+    bool dend = false;
+
+    ready = r8a66597_dma_ready(s, channel, &pipe);
+    qemu_set_irq(s->dreq[channel],
+                 r8a66597_dma_output_level(ready &&
+                                           !s->dma_cycle_hold[channel],
+                                           cfg, DMA_DREQA));
+
+    if (pipe && pipe->index && !r8a66597_pipe_out(s, pipe, select) &&
+        (cfg & DMA_DENDE) && s->dma_dend_pending[channel] &&
+        pipe->fifo_pos < pipe->fifo_len) {
+        remaining = pipe->fifo_len - pipe->fifo_pos;
+        if ((*r8a66597_reg(s, select) & MBW) == MBW_16) {
+            unit = 2;
+        }
+        dend = remaining <= unit;
+    }
+    qemu_set_irq(s->dend[channel],
+                 r8a66597_dma_output_level(dend, cfg, DMA_DENDA));
+}
+
+static void r8a66597_update_dma(R8A66597State *s)
+{
+    r8a66597_update_dma_channel(s, 0);
+    r8a66597_update_dma_channel(s, 1);
+}
+
+static bool r8a66597_dma_access_allowed(R8A66597State *s, hwaddr fifo)
+{
+    int channel = r8a66597_dma_channel(fifo);
+    uint16_t cfg;
+
+    if (channel < 0 ||
+        !(*r8a66597_reg(s, r8a66597_dma_select(channel)) & DREQE)) {
+        return true;
+    }
+    cfg = *r8a66597_reg(s, r8a66597_dma_cfg(channel));
+    if (!(cfg & DMA_DFORM)) {
+        return true;
+    }
+    return r8a66597_dma_input_active(s->dack_level[channel], cfg,
+                                     DMA_DACKA);
+}
+
+static void r8a66597_dma_access_complete(R8A66597State *s, hwaddr fifo)
+{
+    int channel = r8a66597_dma_channel(fifo);
+    uint16_t cfg;
+
+    if (channel < 0 ||
+        !(*r8a66597_reg(s, r8a66597_dma_select(channel)) & DREQE)) {
+        return;
+    }
+    cfg = *r8a66597_reg(s, r8a66597_dma_cfg(channel));
+    if (!(cfg & DMA_BURST)) {
+        s->dma_cycle_hold[channel] = true;
+        r8a66597_update_dma_channel(s, channel);
+        if (!(cfg & DMA_DFORM)) {
+            /* RD/WR terminates a cycle when DACK is not part of the bus. */
+            s->dma_cycle_hold[channel] = false;
+        }
+    }
+    r8a66597_update_dma_channel(s, channel);
+}
+
 static int r8a66597_port_speed(R8A66597State *s, unsigned int port)
 {
     USBDevice *dev = s->port[port].dev;
@@ -361,6 +509,7 @@ static void r8a66597_update_irq(R8A66597State *s)
             ((*r8a66597_reg(s, INTSTS2) &
               *r8a66597_reg(s, INTENB2)) != 0);
     qemu_set_irq(s->irq, level);
+    r8a66597_update_dma(s);
 }
 
 static USBDevice *r8a66597_find_device(R8A66597State *s, uint8_t addr)
@@ -423,6 +572,43 @@ static void r8a66597_count_transaction(R8A66597State *s,
     }
 }
 
+static void r8a66597_dma_packet_received(R8A66597State *s,
+                                         R8A66597Pipe *pipe,
+                                         unsigned int actual)
+{
+    unsigned int channel;
+
+    for (channel = 0; channel < 2; channel++) {
+        hwaddr select = r8a66597_dma_select(channel);
+        uint16_t cfg = *r8a66597_reg(s, r8a66597_dma_cfg(channel));
+        bool short_packet = actual < pipe->packet_len;
+        bool end;
+
+        if (!pipe->index || r8a66597_selected_pipe(s, select) != pipe ||
+            r8a66597_pipe_out(s, pipe, select)) {
+            continue;
+        }
+
+        s->dma_cycle_hold[channel] = false;
+        if (!actual) {
+            end = !(cfg & DMA_PKTM) || pipe->transaction_complete;
+        } else {
+            end = (cfg & DMA_PKTM) || short_packet ||
+                  pipe->transaction_complete;
+        }
+        s->dma_dend_pending[channel] = end;
+
+        if (!actual && end && (cfg & DMA_DENDE)) {
+            int active = r8a66597_dma_output_level(true, cfg, DMA_DENDA);
+            int inactive = r8a66597_dma_output_level(false, cfg, DMA_DENDA);
+
+            qemu_set_irq(s->dend[channel], active);
+            qemu_set_irq(s->dend[channel], inactive);
+            s->dma_dend_pending[channel] = false;
+        }
+    }
+}
+
 static void r8a66597_packet_done(R8A66597State *s, R8A66597Pipe *pipe,
                                  int status, unsigned int actual)
 {
@@ -454,6 +640,7 @@ static void r8a66597_packet_done(R8A66597State *s, R8A66597Pipe *pipe,
                 *ctr = (*ctr & ~PID) | PID_NAK;
             }
             r8a66597_count_transaction(s, pipe, actual);
+            r8a66597_dma_packet_received(s, pipe, actual);
             *r8a66597_reg(s, BRDYSTS) |= bit;
             break;
         case USB_TOKEN_OUT:
@@ -464,6 +651,13 @@ static void r8a66597_packet_done(R8A66597State *s, R8A66597Pipe *pipe,
             pipe->fifo_pos = 0;
             pipe->fifo_ready = false;
             pipe->tx_valid = false;
+            for (unsigned int channel = 0; channel < 2; channel++) {
+                if (r8a66597_selected_pipe(
+                        s, r8a66597_dma_select(channel)) == pipe) {
+                    s->dma_cycle_hold[channel] = false;
+                    s->dma_dend_pending[channel] = false;
+                }
+            }
             *r8a66597_reg(s, BEMPSTS) |= bit;
             if (pipe->index) {
                 *r8a66597_reg(s, BRDYSTS) |= bit;
@@ -653,10 +847,12 @@ static uint16_t r8a66597_fifo_read(R8A66597State *s, hwaddr fifo,
 {
     hwaddr select = r8a66597_fifo_select(fifo);
     R8A66597Pipe *pipe = r8a66597_selected_pipe(s, select);
+    int channel = r8a66597_dma_channel(fifo);
     uint16_t value = 0;
     bool big_endian;
 
-    if (!pipe || !pipe->fifo_ready || !pipe->fifo_len) {
+    if (!pipe || !pipe->fifo_ready || !pipe->fifo_len ||
+        !r8a66597_dma_access_allowed(s, fifo)) {
         return 0;
     }
 
@@ -680,11 +876,15 @@ static uint16_t r8a66597_fifo_read(R8A66597State *s, hwaddr fifo,
     }
 
     if (pipe->fifo_pos >= pipe->fifo_len) {
+        if (channel >= 0) {
+            s->dma_dend_pending[channel] = false;
+        }
         pipe->fifo_len = 0;
         pipe->fifo_pos = 0;
         pipe->fifo_ready = false;
         r8a66597_service_pipe(s, pipe, false);
     }
+    r8a66597_dma_access_complete(s, fifo);
     return value;
 }
 
@@ -696,9 +896,11 @@ static void r8a66597_fifo_write(R8A66597State *s, hwaddr fifo,
     unsigned int maxp;
     bool big_endian;
     bool wide;
+    bool written = false;
 
     if (!pipe || !r8a66597_pipe_out(s, pipe, select) ||
-        pipe->packet_active || pipe->tx_valid) {
+        pipe->packet_active || pipe->tx_valid ||
+        !r8a66597_dma_access_allowed(s, fifo)) {
         return;
     }
 
@@ -711,15 +913,20 @@ static void r8a66597_fifo_write(R8A66597State *s, hwaddr fifo,
     if (size == 1 || !wide) {
         if (pipe->fifo_len < sizeof(pipe->fifo)) {
             pipe->fifo[pipe->fifo_len++] = value;
+            written = true;
         }
     } else if (pipe->fifo_len + 2 <= sizeof(pipe->fifo)) {
         pipe->fifo[pipe->fifo_len++] = big_endian ? value >> 8 : value;
         pipe->fifo[pipe->fifo_len++] = big_endian ? value : value >> 8;
+        written = true;
     }
 
     if (pipe->fifo_len >= maxp) {
         pipe->tx_valid = true;
         r8a66597_service_pipe(s, pipe, false);
+    }
+    if (written) {
+        r8a66597_dma_access_complete(s, fifo);
     }
 }
 
@@ -729,6 +936,7 @@ static void r8a66597_fifo_control_write(R8A66597State *s, hwaddr control,
     hwaddr fifo = r8a66597_fifo_from_control(control);
     hwaddr select = r8a66597_fifo_select(fifo);
     R8A66597Pipe *pipe = r8a66597_selected_pipe(s, select);
+    int channel = r8a66597_dma_channel(fifo);
 
     if (!pipe) {
         return;
@@ -738,6 +946,10 @@ static void r8a66597_fifo_control_write(R8A66597State *s, hwaddr control,
         pipe->fifo_pos = 0;
         pipe->fifo_ready = false;
         pipe->tx_valid = false;
+        if (channel >= 0) {
+            s->dma_cycle_hold[channel] = false;
+            s->dma_dend_pending[channel] = false;
+        }
     }
     if ((value & BVAL) && r8a66597_pipe_out(s, pipe, select)) {
         pipe->tx_valid = true;
@@ -877,6 +1089,7 @@ static void r8a66597_async_packet_complete(USBPort *port, USBPacket *packet)
 
     if (packet->status == USB_RET_REMOVE_FROM_QUEUE) {
         r8a66597_cancel_pipe(pipe);
+        r8a66597_update_dma(s);
         return;
     }
 
@@ -946,6 +1159,47 @@ static USBPortOps r8a66597_port_ops = {
 static USBBusOps r8a66597_bus_ops = {
 };
 
+static void r8a66597_dack(void *opaque, int n, int level)
+{
+    R8A66597State *s = opaque;
+    uint16_t cfg = *r8a66597_reg(s, r8a66597_dma_cfg(n));
+    bool old_active;
+    bool new_active;
+
+    old_active = r8a66597_dma_input_active(s->dack_level[n], cfg,
+                                           DMA_DACKA);
+    s->dack_level[n] = level;
+    new_active = r8a66597_dma_input_active(s->dack_level[n], cfg,
+                                           DMA_DACKA);
+    if (old_active && !new_active) {
+        s->dma_cycle_hold[n] = false;
+    }
+    r8a66597_update_dma_channel(s, n);
+}
+
+static void r8a66597_dend(void *opaque, int n, int level)
+{
+    R8A66597State *s = opaque;
+    hwaddr select = r8a66597_dma_select(n);
+    uint16_t cfg = *r8a66597_reg(s, r8a66597_dma_cfg(n));
+    R8A66597Pipe *pipe = r8a66597_selected_pipe(s, select);
+    bool old_active;
+    bool new_active;
+
+    old_active = r8a66597_dma_input_active(s->dend_level[n], cfg,
+                                           DMA_DENDA);
+    s->dend_level[n] = level;
+    new_active = r8a66597_dma_input_active(s->dend_level[n], cfg,
+                                           DMA_DENDA);
+    if (!old_active && new_active && (cfg & DMA_DENDE) && pipe &&
+        pipe->index && r8a66597_pipe_out(s, pipe, select) &&
+        !pipe->packet_active && !pipe->tx_valid) {
+        pipe->tx_valid = true;
+        r8a66597_service_pipe(s, pipe, false);
+    }
+    r8a66597_update_dma_channel(s, n);
+}
+
 static void r8a66597_write_pipe_ctr(R8A66597State *s,
                                     R8A66597Pipe *pipe, uint16_t value)
 {
@@ -1002,6 +1256,15 @@ static void r8a66597_write16(R8A66597State *s, hwaddr addr, uint16_t value)
             s->resetting[port] = false;
         }
         break;
+    case DMA0CFG:
+    case DMA1CFG:
+        port = addr == DMA1CFG;
+        *r8a66597_reg(s, addr) = value & DMA_CFG_MASK;
+        s->dma_cycle_hold[port] = false;
+        if (!(value & DMA_DENDE)) {
+            s->dma_dend_pending[port] = false;
+        }
+        break;
     case INTSTS0:
     case INTSTS1:
     case INTSTS2:
@@ -1031,6 +1294,12 @@ static void r8a66597_write16(R8A66597State *s, hwaddr addr, uint16_t value)
     case CFIFOSEL:
     case D0FIFOSEL:
     case D1FIFOSEL:
+        if (addr != CFIFOSEL &&
+            ((old ^ value) & (DREQE | CURPIPE))) {
+            port = addr == D1FIFOSEL;
+            s->dma_cycle_hold[port] = false;
+            s->dma_dend_pending[port] = false;
+        }
         *r8a66597_reg(s, addr) = value &
             (RCNT | REW | DCLRM | DREQE | MBW | BIGEND | ISEL | CURPIPE);
         pipe = r8a66597_selected_pipe(s, addr);
@@ -1115,6 +1384,7 @@ static void r8a66597_write16(R8A66597State *s, hwaddr addr, uint16_t value)
         *r8a66597_reg(s, addr) = value;
         break;
     }
+    r8a66597_update_dma(s);
 }
 
 static void r8a66597_write(void *opaque, hwaddr addr, uint64_t value,
@@ -1181,6 +1451,12 @@ static void r8a66597_reset(DeviceState *dev)
     *r8a66597_reg(s, DCPMAXP) = 0x40;
     s->control_length = 0;
     s->control_done = 0;
+    for (i = 0; i < 2; i++) {
+        s->dack_level[i] = true;
+        s->dend_level[i] = true;
+        s->dma_cycle_hold[i] = false;
+        s->dma_dend_pending[i] = false;
+    }
     for (i = 0; i < R8A66597_NUM_PORTS; i++) {
         s->connected[i] = s->port[i].dev && s->port[i].dev->attached;
         s->resetting[i] = false;
@@ -1229,11 +1505,16 @@ static void r8a66597_unrealize(DeviceState *dev)
 static void r8a66597_init(Object *obj)
 {
     R8A66597State *s = R8A66597_USB_HOST(obj);
+    DeviceState *dev = DEVICE(obj);
     SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
 
     memory_region_init_io(&s->mmio, obj, &r8a66597_mmio_ops, s,
                           "r8a66597", R8A66597_MMIO_SIZE);
     sysbus_init_mmio(sbd, &s->mmio);
+    qdev_init_gpio_out_named(dev, s->dreq, "dreq", 2);
+    qdev_init_gpio_out_named(dev, s->dend, "dend-out", 2);
+    qdev_init_gpio_in_named(dev, r8a66597_dack, "dack", 2);
+    qdev_init_gpio_in_named(dev, r8a66597_dend, "dend-in", 2);
 }
 
 USBBus *r8a66597_usb_bus(R8A66597State *s)
