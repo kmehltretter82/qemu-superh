@@ -136,6 +136,9 @@
 #define SM501_POWER_MODE_1_CLOCK        0x00004C
 #define SM501_SLEEP_MODE_GATE           0x000050
 #define SM501_POWER_MODE_CONTROL        0x000054
+#define SM501_GATE_MASK                 0x00079DFF
+#define SM501_CLOCK_MASK                0x7F1F1F1F
+#define SM501_SLEEP_GATE_MASK           0x007FE000
 
 /* power gates for units within the 501 */
 #define SM501_GATE_HOST                 0
@@ -484,7 +487,12 @@ typedef struct SM501State {
     uint32_t arbitration_control;
     uint32_t irq_mask;
     uint32_t misc_timing;
+    uint32_t power_mode_gate[2];
+    uint32_t power_mode_clock[2];
+    uint32_t sleep_mode_gate;
     uint32_t power_mode_control;
+    uint32_t programmable_pll_control;
+    uint8_t revision;
 
     uint8_t i2c_byte_count;
     uint8_t i2c_status;
@@ -1006,7 +1014,7 @@ static uint64_t sm501_system_config_read(void *opaque, hwaddr addr,
         ret = s->gpio_63_32_control;
         break;
     case SM501_DEVICEID:
-        ret = 0x050100A0;
+        ret = SM501_DEVICEID_SM501 | s->revision;
         break;
     case SM501_DRAM_CONTROL:
         ret = (s->dram_control & 0x07F1E7C0);
@@ -1025,14 +1033,38 @@ static uint64_t sm501_system_config_read(void *opaque, hwaddr addr,
         ret = s->misc_timing;
         break;
     case SM501_CURRENT_GATE:
-        /* TODO : simulate gate control */
-        ret = 0x00021807;
+        switch (s->power_mode_control & 3) {
+        case 0:
+        case 1:
+            ret = s->power_mode_gate[s->power_mode_control & 1];
+            break;
+        case 2:
+            ret = s->sleep_mode_gate;
+            break;
+        }
         break;
     case SM501_CURRENT_CLOCK:
-        ret = 0x2A1A0A09;
+        if ((s->power_mode_control & 3) < 2) {
+            ret = s->power_mode_clock[s->power_mode_control & 1];
+        }
+        break;
+    case SM501_POWER_MODE_0_GATE:
+    case SM501_POWER_MODE_1_GATE:
+        ret = s->power_mode_gate[(addr - SM501_POWER_MODE_0_GATE) / 8];
+        break;
+    case SM501_POWER_MODE_0_CLOCK:
+    case SM501_POWER_MODE_1_CLOCK:
+        ret = s->power_mode_clock[(addr - SM501_POWER_MODE_0_CLOCK) / 8];
+        break;
+    case SM501_SLEEP_MODE_GATE:
+        ret = s->sleep_mode_gate;
         break;
     case SM501_POWER_MODE_CONTROL:
-        ret = s->power_mode_control;
+        ret = s->power_mode_control |
+              ((s->power_mode_control & 3) == 2 ? BIT(2) : 0);
+        break;
+    case SM501_PROGRAMMABLE_PLL_CONTROL:
+        ret = s->programmable_pll_control;
         break;
     case SM501_ENDIAN_CONTROL:
         ret = 0; /* Only default little endian mode is supported */
@@ -1083,12 +1115,26 @@ static void sm501_system_config_write(void *opaque, hwaddr addr,
         break;
     case SM501_POWER_MODE_0_GATE:
     case SM501_POWER_MODE_1_GATE:
+        s->power_mode_gate[(addr - SM501_POWER_MODE_0_GATE) / 8] =
+            value & SM501_GATE_MASK;
+        break;
     case SM501_POWER_MODE_0_CLOCK:
     case SM501_POWER_MODE_1_CLOCK:
-        /* TODO : simulate gate & clock control */
+        s->power_mode_clock[(addr - SM501_POWER_MODE_0_CLOCK) / 8] =
+            value & SM501_CLOCK_MASK;
+        break;
+    case SM501_SLEEP_MODE_GATE:
+        s->sleep_mode_gate = value & SM501_SLEEP_GATE_MASK;
         break;
     case SM501_POWER_MODE_CONTROL:
-        s->power_mode_control = value & 0x00000003;
+        if ((value & 3) != 3) {
+            s->power_mode_control = value & 3;
+        }
+        break;
+    case SM501_PROGRAMMABLE_PLL_CONTROL:
+        if (s->revision >= 0xc0) {
+            s->programmable_pll_control = value & 0x0003ffff;
+        }
         break;
     case SM501_ENDIAN_CONTROL:
         if (value & 0x00000001) {
@@ -1906,7 +1952,13 @@ static void sm501_reset(SM501State *s)
     s->arbitration_control = 0x05146732;
     s->irq_mask = 0;
     s->misc_timing = 0;
+    s->power_mode_gate[0] = 0x00021807;
+    s->power_mode_gate[1] = 0x00021807;
+    s->power_mode_clock[0] = 0x2a1a0a09;
+    s->power_mode_clock[1] = 0x2a1a0a09;
+    s->sleep_mode_gate = 0x00018000;
     s->power_mode_control = 0;
+    s->programmable_pll_control = 0;
     s->i2c_byte_count = 0;
     s->i2c_status = 0;
     s->i2c_addr = 0;
@@ -1964,7 +2016,7 @@ static void sm501_init(SM501State *s, DeviceState *dev,
     memory_region_init(&s->mmio_region, OBJECT(dev), "sm501.mmio", MMIO_SIZE);
     memory_region_init_io(&s->system_config_region, OBJECT(dev),
                           &sm501_system_config_ops, s,
-                          "sm501-system-config", 0x6c);
+                          "sm501-system-config", 0x78);
     memory_region_add_subregion(&s->mmio_region, SM501_SYS_CONFIG,
                                 &s->system_config_region);
     memory_region_init_io(&s->i2c_region, OBJECT(dev), &sm501_i2c_ops, s,
@@ -1985,10 +2037,26 @@ static void sm501_init(SM501State *s, DeviceState *dev,
     s->con = qemu_graphic_console_create(dev, 0, &sm501_ops, s);
 }
 
+static int sm501_state_post_load(void *opaque, int version_id)
+{
+    SM501State *s = opaque;
+
+    if (version_id < 2) {
+        s->power_mode_gate[0] = 0x00021807;
+        s->power_mode_gate[1] = 0x00021807;
+        s->power_mode_clock[0] = 0x2a1a0a09;
+        s->power_mode_clock[1] = 0x2a1a0a09;
+        s->sleep_mode_gate = 0x00018000;
+        s->programmable_pll_control = 0;
+    }
+    return 0;
+}
+
 static const VMStateDescription vmstate_sm501_state = {
     .name = "sm501-state",
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
+    .post_load = sm501_state_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(local_mem_size_index, SM501State),
         VMSTATE_UINT32(system_control, SM501State),
@@ -2000,6 +2068,10 @@ static const VMStateDescription vmstate_sm501_state = {
         VMSTATE_UINT32(irq_mask, SM501State),
         VMSTATE_UINT32(misc_timing, SM501State),
         VMSTATE_UINT32(power_mode_control, SM501State),
+        VMSTATE_UINT32_ARRAY_V(power_mode_gate, SM501State, 2, 2),
+        VMSTATE_UINT32_ARRAY_V(power_mode_clock, SM501State, 2, 2),
+        VMSTATE_UINT32_V(sleep_mode_gate, SM501State, 2),
+        VMSTATE_UINT32_V(programmable_pll_control, SM501State, 2),
         VMSTATE_UINT32(uart0_ier, SM501State),
         VMSTATE_UINT32(uart0_lcr, SM501State),
         VMSTATE_UINT32(uart0_mcr, SM501State),
@@ -2105,6 +2177,7 @@ static void sm501_realize_sysbus(DeviceState *dev, Error **errp)
 
 static const Property sm501_sysbus_properties[] = {
     DEFINE_PROP_UINT32("vram-size", SM501SysBusState, vram_size, 0),
+    DEFINE_PROP_UINT8("revision", SM501SysBusState, state.revision, 0xa0),
     /* this a debug option, prefer PROP_UINT over PROP_BIT for simplicity */
     DEFINE_PROP_UINT8("x-pixman", SM501SysBusState, state.use_pixman, DEFAULT_X_PIXMAN),
 };
@@ -2193,6 +2266,7 @@ static void sm501_realize_pci(PCIDevice *dev, Error **errp)
 
 static const Property sm501_pci_properties[] = {
     DEFINE_PROP_UINT32("vram-size", SM501PCIState, vram_size, 64 * MiB),
+    DEFINE_PROP_UINT8("revision", SM501PCIState, state.revision, 0xa0),
     DEFINE_PROP_UINT8("x-pixman", SM501PCIState, state.use_pixman, DEFAULT_X_PIXMAN),
 };
 
