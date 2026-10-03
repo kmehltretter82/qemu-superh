@@ -59,6 +59,7 @@ struct SH7785State {
     void (*mmselr_hook)(void *opaque, int areasel);
     void *mmselr_opaque;
     uint32_t regvals[ARRAY_SIZE(sh7785_regs)];
+    unsigned int console_scif;
 };
 
 /*
@@ -526,7 +527,9 @@ static void sh7785_scif_init(SH7785State *s, MemoryRegion *sysmem, int n)
     SysBusDevice *sb = SYS_BUS_DEVICE(dev);
 
     dev->id = g_strdup_printf("scif%d", n);
-    qdev_prop_set_chr(dev, "chardev", serial_hd(n));
+    qdev_prop_set_chr(dev, "chardev",
+                      serial_hd(n == s->console_scif ? 0 :
+                                n < s->console_scif ? n + 1 : n));
     qdev_prop_set_uint8(dev, "features",
                         SH_SERIAL_FEAT_SCIF | SH_SERIAL_FEAT_FIFODATA);
     sysbus_realize_and_unref(sb, &error_fatal);
@@ -559,7 +562,7 @@ static void sh7785_scif_init(SH7785State *s, MemoryRegion *sysmem, int n)
 }
 
 SH7785State *sh7785_init(SuperHCPU *cpu, MemoryRegion *sysmem,
-                         uint32_t pclk_hz)
+                         uint32_t pclk_hz, unsigned int console_scif)
 {
     SH7785State *s = g_new0(SH7785State, 1);
     DeviceState *intc;
@@ -567,6 +570,8 @@ SH7785State *sh7785_init(SuperHCPU *cpu, MemoryRegion *sysmem,
     int i;
 
     s->cpu = cpu;
+    assert(console_scif < 6);
+    s->console_scif = console_scif;
     for (i = 0; i < ARRAY_SIZE(sh7785_regs); i++) {
         s->regvals[i] = sh7785_regs[i].reset;
     }

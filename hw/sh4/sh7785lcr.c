@@ -55,7 +55,14 @@
 #include "hw/i2c/i2c.h"
 #include "hw/i2c/pca9564.h"
 #include "hw/core/sysbus.h"
+#include "hw/core/qdev-properties.h"
+#include "hw/misc/led.h"
+#include "hw/scsi/scsi.h"
+#include "hw/sd/cg200.h"
+#include "hw/sd/sd.h"
 #include "hw/usb/hcd-r8a66597.h"
+#include "hw/usb/msd.h"
+#include "migration/vmstate.h"
 #include "system/address-spaces.h"
 #include "system/reset.h"
 #include "system/runstate.h"
@@ -73,8 +80,14 @@
 #define FLASH_BASE          0x00000000
 #define FLASH_SIZE          (64 * MiB)
 #define PLD_BASE            0x04000000
+#define PLD_PCICR           0x00
+#define PLD_LCD_BK_CONTR    0x02
+#define PLD_LOCALCR         0x04
 #define PLD_POFCR           0x06    /* write 1: power off */
+#define PLD_LEDCR           0x08
+#define PLD_SWSR            0x0a
 #define PLD_VERSR           0x0c
+#define PLD_MMSR            0x0e
 
 #define PCA9564_BASE        0x06000000
 #define SM501_VRAM_BASE     0x10000000
@@ -83,6 +96,8 @@
 
 #define USB_32BIT_BASE      0x08000000
 #define USB_29BIT_BASE      0x14000000
+#define CG200_32BIT_BASE    0x0c000000
+#define CG200_29BIT_BASE    0x18000000
 
 #define FRQMR1              0xffc80014
 #define FRQMR1_MODE16       0x12252448
@@ -90,6 +105,19 @@
 
 #define TYPE_SH7785LCR_MACHINE MACHINE_TYPE_NAME("sh7785lcr")
 OBJECT_DECLARE_SIMPLE_TYPE(SH7785LCRMachineState, SH7785LCR_MACHINE)
+
+#define TYPE_SH7785LCR_PLD "sh7785lcr-pld"
+OBJECT_DECLARE_SIMPLE_TYPE(SH7785LCRPLDState, SH7785LCR_PLD)
+
+struct SH7785LCRPLDState {
+    SysBusDevice parent_obj;
+    MemoryRegion mmio;
+    uint16_t regs[8];
+    uint8_t dipsw;
+    uint16_t version;
+    LEDState *led[8];
+    LEDState *backlight;
+};
 
 struct SH7785LCRMachineState {
     MachineState parent_obj;
@@ -102,6 +130,8 @@ struct SH7785LCRMachineState {
     bool kernel;            /* -kernel: leave the firmware's state */
     MemoryRegion area2, area3;
     MemoryRegion *pci_mem1;
+    uint8_t dipsw;
+    char *usb_device;
 };
 
 static void sh7785lcr_areasel(void *opaque, int areasel)
@@ -141,38 +171,144 @@ static uint64_t sh7785lcr_elf_to_phys(void *opaque, uint64_t addr)
     return s->boot32 ? DDR_BASE + (addr & 0x1fffffff) : addr & 0x1fffffff;
 }
 
-/* PLD: only the registers the kernel and the test rig use */
-static uint64_t pld_read(void *opaque, hwaddr addr, unsigned size)
+static uint16_t sh7785lcr_pld_reg(SH7785LCRPLDState *s, hwaddr addr)
 {
-    uint16_t *regs = opaque;
-
-    if (addr == PLD_VERSR) {
-        return 0x0001;
+    switch (addr & ~1) {
+    case PLD_SWSR:
+        return s->dipsw & 0x0f;
+    case PLD_VERSR:
+        return s->version;
+    default:
+        return s->regs[(addr & 0xf) / 2];
     }
-    return addr < 0x10 ? regs[addr / 2] : 0;
 }
 
-static void pld_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
+static void sh7785lcr_pld_update_outputs(SH7785LCRPLDState *s)
 {
-    uint16_t *regs = opaque;
+    uint16_t ledcr = s->regs[PLD_LEDCR / 2];
 
-    if (addr == PLD_POFCR && (val & 1)) {
+    for (unsigned int i = 0; i < ARRAY_SIZE(s->led); i++) {
+        led_set_state(s->led[i], ledcr & BIT(i));
+    }
+    led_set_state(s->backlight, s->regs[PLD_LCD_BK_CONTR / 2] != 0);
+}
+
+static uint64_t sh7785lcr_pld_read(void *opaque, hwaddr addr, unsigned size)
+{
+    SH7785LCRPLDState *s = opaque;
+    uint16_t value = sh7785lcr_pld_reg(s, addr);
+
+    return size == 1 ? extract16(value, (addr & 1) * 8, 8) : value;
+}
+
+static void sh7785lcr_pld_write(void *opaque, hwaddr addr, uint64_t val,
+                                unsigned size)
+{
+    SH7785LCRPLDState *s = opaque;
+    unsigned int reg = (addr & 0xf) / 2;
+    uint16_t value;
+
+    if ((addr & ~1) == PLD_SWSR || (addr & ~1) == PLD_VERSR) {
+        return;
+    }
+    value = s->regs[reg];
+    if (size == 1) {
+        value = deposit32(value, (addr & 1) * 8, 8, val);
+    } else {
+        value = val;
+    }
+    s->regs[reg] = value;
+
+    if ((addr & ~1) == PLD_POFCR && (value & 1)) {
         qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
         return;
     }
-    if (addr < 0x10) {
-        regs[addr / 2] = val;
+    if ((addr & ~1) == PLD_LEDCR ||
+        (addr & ~1) == PLD_LCD_BK_CONTR) {
+        sh7785lcr_pld_update_outputs(s);
     }
 }
 
-static const MemoryRegionOps pld_ops = {
-    .read = pld_read,
-    .write = pld_write,
+static const MemoryRegionOps sh7785lcr_pld_ops = {
+    .read = sh7785lcr_pld_read,
+    .write = sh7785lcr_pld_write,
     .endianness = DEVICE_NATIVE_ENDIAN,
     .valid.min_access_size = 1,
     .valid.max_access_size = 2,
     .impl.min_access_size = 1,
     .impl.max_access_size = 2,
+};
+
+static void sh7785lcr_pld_reset(DeviceState *dev)
+{
+    SH7785LCRPLDState *s = SH7785LCR_PLD(dev);
+
+    memset(s->regs, 0, sizeof(s->regs));
+    sh7785lcr_pld_update_outputs(s);
+}
+
+static int sh7785lcr_pld_post_load(void *opaque, int version_id)
+{
+    sh7785lcr_pld_update_outputs(opaque);
+    return 0;
+}
+
+static const VMStateDescription vmstate_sh7785lcr_pld = {
+    .name = TYPE_SH7785LCR_PLD,
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .post_load = sh7785lcr_pld_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT16_ARRAY(regs, SH7785LCRPLDState, 8),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+static const Property sh7785lcr_pld_properties[] = {
+    DEFINE_PROP_UINT8("dipsw", SH7785LCRPLDState, dipsw, 0),
+    DEFINE_PROP_UINT16("version", SH7785LCRPLDState, version, 1),
+};
+
+static void sh7785lcr_pld_realize(DeviceState *dev, Error **errp)
+{
+    SH7785LCRPLDState *s = SH7785LCR_PLD(dev);
+
+    for (unsigned int i = 0; i < ARRAY_SIZE(s->led); i++) {
+        g_autofree char *name = g_strdup_printf("LED%u", i + 3);
+
+        s->led[i] = led_create_simple(OBJECT(dev), GPIO_POLARITY_ACTIVE_LOW,
+                                      LED_COLOR_GREEN, name);
+    }
+    s->backlight = led_create_simple(OBJECT(dev), GPIO_POLARITY_ACTIVE_LOW,
+                                     LED_COLOR_YELLOW, "LCD backlight");
+    sh7785lcr_pld_update_outputs(s);
+}
+
+static void sh7785lcr_pld_init(Object *obj)
+{
+    SH7785LCRPLDState *s = SH7785LCR_PLD(obj);
+
+    memory_region_init_io(&s->mmio, obj, &sh7785lcr_pld_ops, s,
+                          TYPE_SH7785LCR_PLD, 0x10);
+    sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->mmio);
+}
+
+static void sh7785lcr_pld_class_init(ObjectClass *oc, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(oc);
+
+    dc->realize = sh7785lcr_pld_realize;
+    device_class_set_legacy_reset(dc, sh7785lcr_pld_reset);
+    device_class_set_props(dc, sh7785lcr_pld_properties);
+    dc->vmsd = &vmstate_sh7785lcr_pld;
+}
+
+static const TypeInfo sh7785lcr_pld_info = {
+    .name = TYPE_SH7785LCR_PLD,
+    .parent = TYPE_SYS_BUS_DEVICE,
+    .instance_size = sizeof(SH7785LCRPLDState),
+    .instance_init = sh7785lcr_pld_init,
+    .class_init = sh7785lcr_pld_class_init,
 };
 
 static struct QEMU_PACKED {
@@ -274,12 +410,40 @@ static void sh7785lcr_load_kernel(SH7785LCRMachineState *s,
     }
 }
 
+static void sh7785lcr_attach_usb_storage(USBBus *bus)
+{
+    DriveInfo *dinfo = drive_get(IF_NONE, 0, 0);
+    DeviceState *bot;
+    DeviceState *disk;
+
+    if (!dinfo) {
+        error_report("usb-device=storage requires an if=none drive");
+        exit(1);
+    }
+
+    bot = qdev_new("usb-bot");
+    qdev_prop_set_string(bot, "serial", "1");
+    qdev_realize_and_unref(bot, BUS(bus), &error_fatal);
+
+    disk = qdev_new("scsi-hd");
+    qdev_prop_set_uint32(disk, "scsi-id", 0);
+    qdev_prop_set_uint32(disk, "lun", 0);
+    qdev_prop_set_bit(disk, "removable", true);
+    qdev_prop_set_int32(disk, "scsi_version", 0);
+    qdev_prop_set_string(disk, "vendor", "Kingston");
+    qdev_prop_set_string(disk, "product", "DataTraveler 2.0");
+    qdev_prop_set_string(disk, "ver", "PMAP");
+    qdev_prop_set_drive_err(disk, "drive", blk_by_legacy_dinfo(dinfo),
+                            &error_fatal);
+    qdev_realize_and_unref(disk, &USB_STORAGE_DEV(bot)->bus.qbus,
+                           &error_fatal);
+}
+
 static void sh7785lcr_init(MachineState *machine)
 {
     MachineClass *mc = MACHINE_GET_CLASS(machine);
     SH7785LCRMachineState *s = SH7785LCR_MACHINE(machine);
     MemoryRegion *sysmem = get_system_memory();
-    MemoryRegion *pld = g_new(MemoryRegion, 1);
     PCIBus *pci_bus;
     PCIIDEState *sata;
     DeviceState *dev;
@@ -287,6 +451,8 @@ static void sh7785lcr_init(MachineState *machine)
     I2CBus *i2c_bus;
     DeviceState *usb;
     SysBusDevice *usb_sbd;
+    DeviceState *cg200;
+    SysBusDevice *cg200_sbd;
     DriveInfo *dinfo;
 
     if (machine->ram_size != DDR_SIZE) {
@@ -307,7 +473,8 @@ static void sh7785lcr_init(MachineState *machine)
     memory_region_add_subregion(sysmem, AREA2_BASE, &s->area2);
     memory_region_add_subregion(sysmem, AREA3_BASE, &s->area3);
 
-    s->soc = sh7785_init(s->cpu, sysmem, PCLK_HZ);
+    /* CN5, the board's physical serial console, is connected to SCIF1. */
+    s->soc = sh7785_init(s->cpu, sysmem, PCLK_HZ, 1);
     sh7785_set_reg(s->soc, FRQMR1, FRQMR1_MODE16);
     s->pci_mem1 = sysbus_mmio_get_region(SYS_BUS_DEVICE(sh7785_pcic(s->soc)),
                                          SH7785_PCIC_MMIO_MEM1);
@@ -333,6 +500,7 @@ static void sh7785lcr_init(MachineState *machine)
     dev = qdev_new("sysbus-sm501");
     sbd = SYS_BUS_DEVICE(dev);
     qdev_prop_set_uint32(dev, "vram-size", SM501_VRAM_SIZE);
+    qdev_prop_set_uint8(dev, "revision", 0xc0);
     qdev_prop_set_uint64(dev, "dma-offset", SM501_VRAM_BASE);
     sysbus_realize_and_unref(sbd, &error_fatal);
     sysbus_mmio_map_overlap(sbd, 0, SM501_VRAM_BASE, 2);
@@ -347,29 +515,55 @@ static void sh7785lcr_init(MachineState *machine)
     i2c_bus = I2C_BUS(qdev_get_child_bus(dev, "i2c"));
     i2c_slave_create_simple(i2c_bus, "r2025sd", 0x32);
 
-    /*
-     * NOR flash: Linux registers it as physmap-flash with bankwidth 4.
-     * TODO(manual): the exact part is not verified; AMD command set with
-     * Spansion S29GL512 IDs is assumed.
-     */
+    /* Two S29GL256P-compatible x16 devices on a 32-bit bank. */
     dinfo = drive_get(IF_PFLASH, 0, 0);
-    pflash_cfi02_register(FLASH_BASE, "sh7785lcr.flash", FLASH_SIZE,
-                          dinfo ? blk_by_legacy_dinfo(dinfo) : NULL,
-                          128 * KiB, 1, 4, 0x0001, 0x227e, 0x2223, 0x2201,
-                          0x555, 0x2aa, 0);
+    pflash_cfi02_register_with_device_width(
+        FLASH_BASE, "sh7785lcr.flash", FLASH_SIZE,
+        dinfo ? blk_by_legacy_dinfo(dinfo) : NULL,
+        256 * KiB, 1, 4, 2, 0x0001, 0x2201, 0, 0,
+        0x555, 0x2aa, 0);
 
-    memory_region_init_io(pld, NULL, &pld_ops, g_new0(uint16_t, 8),
-                          "sh7785lcr-pld", 0x10);
-    memory_region_add_subregion(sysmem, PLD_BASE, pld);
+    dev = qdev_new(TYPE_SH7785LCR_PLD);
+    qdev_prop_set_uint8(dev, "dipsw", s->dipsw);
+    sbd = SYS_BUS_DEVICE(dev);
+    sysbus_realize_and_unref(sbd, &error_fatal);
+    sysbus_mmio_map(sbd, 0, PLD_BASE);
 
     usb = qdev_new(TYPE_R8A66597_USB_HOST);
+    object_property_add_child(OBJECT(machine), "usb-host", OBJECT(usb));
     usb_sbd = SYS_BUS_DEVICE(usb);
     sysbus_realize_and_unref(usb_sbd, &error_fatal);
     memory_region_add_subregion_overlap(
         sysmem, s->boot32 ? USB_32BIT_BASE : USB_29BIT_BASE,
         sysbus_mmio_get_region(usb_sbd, 0), 2);
     sysbus_connect_irq(usb_sbd, 0, sh7785_irq_pin(s->soc, 0));
-    usb_create_simple(r8a66597_usb_bus(R8A66597_USB_HOST(usb)), "usb-kbd");
+    if (!strcmp(s->usb_device, "keyboard")) {
+        usb_create_simple(r8a66597_usb_bus(R8A66597_USB_HOST(usb)),
+                          "usb-kbd");
+    } else if (!strcmp(s->usb_device, "storage")) {
+        sh7785lcr_attach_usb_storage(
+            r8a66597_usb_bus(R8A66597_USB_HOST(usb)));
+    }
+
+    cg200 = qdev_new(TYPE_CG200);
+    object_property_add_child(OBJECT(machine), "cg200", OBJECT(cg200));
+    cg200_sbd = SYS_BUS_DEVICE(cg200);
+    sysbus_realize_and_unref(cg200_sbd, &error_fatal);
+    memory_region_add_subregion_overlap(
+        sysmem, s->boot32 ? CG200_32BIT_BASE : CG200_29BIT_BASE,
+        sysbus_mmio_get_region(cg200_sbd, 0), 2);
+    sysbus_connect_irq(cg200_sbd, 0, sh7785_irq_pin(s->soc, 1));
+    for (unsigned int i = 0; i < 2; i++) {
+        DeviceState *card = qdev_new(TYPE_SD_CARD);
+        DriveInfo *sd_dinfo = drive_get(IF_SD, 0, i);
+
+        qdev_prop_set_drive_err(card, "drive",
+                                sd_dinfo ? blk_by_legacy_dinfo(sd_dinfo) : NULL,
+                                &error_fatal);
+        qdev_realize_and_unref(card,
+                               BUS(cg200_get_bus(CG200(cg200), i)),
+                               &error_fatal);
+    }
 
     if (machine->kernel_filename) {
         sh7785lcr_load_kernel(s, machine);
@@ -400,6 +594,25 @@ static void sh7785lcr_set_boot32(Object *obj, bool value, Error **errp)
     SH7785LCR_MACHINE(obj)->boot32 = value;
 }
 
+static char *sh7785lcr_get_usb_device(Object *obj, Error **errp)
+{
+    return g_strdup(SH7785LCR_MACHINE(obj)->usb_device);
+}
+
+static void sh7785lcr_set_usb_device(Object *obj, const char *value,
+                                     Error **errp)
+{
+    SH7785LCRMachineState *s = SH7785LCR_MACHINE(obj);
+
+    if (strcmp(value, "keyboard") && strcmp(value, "storage") &&
+        strcmp(value, "none")) {
+        error_setg(errp, "usb-device must be keyboard, storage, or none");
+        return;
+    }
+    g_free(s->usb_device);
+    s->usb_device = g_strdup(value);
+}
+
 static void sh7785lcr_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
@@ -415,6 +628,15 @@ static void sh7785lcr_class_init(ObjectClass *oc, const void *data)
                                    sh7785lcr_set_boot32);
     object_class_property_set_description(oc, "boot32",
         "Mode pins select 32-bit boot (PMB, 32-bit physical addresses)");
+    object_class_property_add_uint8_ptr(oc, "dipsw",
+        offsetof(SH7785LCRMachineState, dipsw), OBJ_PROP_FLAG_READWRITE);
+    object_class_property_set_description(oc, "dipsw",
+        "Four-bit SW4 DIP switch value exposed by the board PLD");
+    object_class_property_add_str(oc, "usb-device",
+                                  sh7785lcr_get_usb_device,
+                                  sh7785lcr_set_usb_device);
+    object_class_property_set_description(oc, "usb-device",
+        "Default R8A66597 attachment: keyboard, storage, or none");
     object_class_property_add(oc, "zero-page-offset", "uint32",
                               sh7785lcr_get_zero_page,
                               sh7785lcr_set_zero_page, NULL, NULL);
@@ -425,7 +647,15 @@ static void sh7785lcr_class_init(ObjectClass *oc, const void *data)
 
 static void sh7785lcr_instance_init(Object *obj)
 {
-    SH7785LCR_MACHINE(obj)->zero_page = 0x1000;
+    SH7785LCRMachineState *s = SH7785LCR_MACHINE(obj);
+
+    s->zero_page = 0x1000;
+    s->usb_device = g_strdup("keyboard");
+}
+
+static void sh7785lcr_instance_finalize(Object *obj)
+{
+    g_free(SH7785LCR_MACHINE(obj)->usb_device);
 }
 
 static const TypeInfo sh7785lcr_info = {
@@ -433,11 +663,13 @@ static const TypeInfo sh7785lcr_info = {
     .parent = TYPE_MACHINE,
     .instance_size = sizeof(SH7785LCRMachineState),
     .instance_init = sh7785lcr_instance_init,
+    .instance_finalize = sh7785lcr_instance_finalize,
     .class_init = sh7785lcr_class_init,
 };
 
 static void sh7785lcr_register_types(void)
 {
+    type_register_static(&sh7785lcr_pld_info);
     type_register_static(&sh7785lcr_info);
 }
 

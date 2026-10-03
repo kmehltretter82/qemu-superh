@@ -26,6 +26,7 @@ Contents:
    target-riscv
    target-rx
    target-s390x
+   target-sh4
    target-sparc
    target-sparc64
    target-i386

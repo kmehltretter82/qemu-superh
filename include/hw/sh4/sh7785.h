@@ -13,7 +13,7 @@
 typedef struct SH7785State SH7785State;
 
 SH7785State *sh7785_init(SuperHCPU *cpu, MemoryRegion *sysmem,
-                         uint32_t pclk_hz);
+                         uint32_t pclk_hz, unsigned int console_scif);
 
 /* After cpu_reset(): apply the mode-pin selected 32-bit boot state. */
 void sh7785_reset_32bit_boot(SH7785State *s);

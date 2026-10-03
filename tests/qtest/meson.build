@@ -206,7 +206,8 @@ qtests_ppc64 = \
 
 qtests_sh4 = (config_all_devices.has_key('CONFIG_ISA_TESTDEV') ? ['endianness-test'] : []) + \
   (config_all_devices.has_key('CONFIG_PFLASH_CFI02') and
-   config_all_devices.has_key('CONFIG_R2D') ? ['pflash-cfi02-test'] : [])
+   config_all_devices.has_key('CONFIG_R2D') ? ['pflash-cfi02-test'] : []) + \
+  (config_all_devices.has_key('CONFIG_SH7785LCR') ? ['sh7785lcr-test'] : [])
 qtests_sh4eb = (config_all_devices.has_key('CONFIG_ISA_TESTDEV') ? ['endianness-test'] : [])
 
 qtests_sparc = ['prom-env-test', 'm48t59-test', 'boot-serial-test'] + \
