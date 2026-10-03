@@ -14,6 +14,10 @@ config SDHCI
     bool
     select SD
 
+config CG200
+    bool
+    select SDHCI
+
 config SDHCI_PCI
     bool
     default y if PCI_DEVICES
