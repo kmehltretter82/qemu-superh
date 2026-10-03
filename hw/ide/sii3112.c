@@ -262,6 +262,19 @@ static void sii3112_pci_realize(PCIDevice *dev, Error **errp)
                  pci_get_word(dev->config + PCI_STATUS) |
                  PCI_STATUS_66MHZ);
 
+    if (object_dynamic_cast(OBJECT(dev), TYPE_SII3512_PCI)) {
+        int pm_cap = pci_pm_init(dev, 0x60, errp);
+
+        if (pm_cap < 0) {
+            return;
+        }
+        pci_set_word(dev->config + pm_cap + PCI_PM_PMC,
+                     PCI_PM_CAP_VER_1_1 | PCI_PM_CAP_D1 | PCI_PM_CAP_D2);
+        if (!pci_register_erased_rom_bar(dev, 512 * 1024, errp)) {
+            return;
+        }
+    }
+
     /* BAR5 is in PCI memory space */
     memory_region_init_io(&d->mmio, OBJECT(d), &sii3112_reg_ops, d,
                          "sii3112.bar5", 0x200);

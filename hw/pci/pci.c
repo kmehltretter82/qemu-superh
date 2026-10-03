@@ -2670,6 +2670,35 @@ static void pci_del_option_rom(PCIDevice *pdev)
     pdev->has_rom = false;
 }
 
+bool pci_register_erased_rom_bar(PCIDevice *pdev, uint32_t size,
+                                 Error **errp)
+{
+    char name[64];
+
+    if (!pdev->rom_bar) {
+        return true;
+    }
+    if (pdev->romfile && pdev->romfile[0]) {
+        if (pdev->romsize == UINT32_MAX) {
+            pdev->romsize = size;
+        }
+        return true;
+    }
+
+    snprintf(name, sizeof(name), "%s.rom",
+             object_get_typename(OBJECT(pdev)));
+    if (!memory_region_init_rom(&pdev->rom, OBJECT(pdev), name, size,
+                                errp)) {
+        return false;
+    }
+
+    memset(memory_region_get_ram_ptr(&pdev->rom), 0xff, size);
+    pdev->romsize = size;
+    pdev->has_rom = true;
+    pci_register_bar(pdev, PCI_ROM_SLOT, 0, &pdev->rom);
+    return true;
+}
+
 /*
  * On success, pci_add_capability() returns a positive value
  * that the offset of the pci capability.

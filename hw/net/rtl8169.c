@@ -814,6 +814,9 @@ static void rtl8169_realize(PCIDevice *pdev, Error **errp)
                              &s->io_bar, 0, RTL8169_REGS_SIZE);
     pci_register_bar(pdev, 0, PCI_BASE_ADDRESS_SPACE_IO, &s->io_bar);
     pci_register_bar(pdev, 1, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->mem_bar);
+    if (!pci_register_erased_rom_bar(pdev, 128 * 1024, errp)) {
+        return;
+    }
 
     qemu_macaddr_default_if_unset(&s->conf.macaddr);
     s->nic = qemu_new_nic(&rtl8169_net_info, &s->conf,
